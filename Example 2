@@ -1,0 +1,660 @@
+import os
+import matplotlib
+matplotlib.use("Agg")
+import torch
+import torch.nn as nn
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.interpolate import RegularGridInterpolator, griddata
+
+# ============================
+# 0. 全局设置
+# ============================
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# 强制显式初始化 CUDA 上下文，避免运行时警告
+if torch.cuda.is_available():
+    torch.cuda.init()
+
+torch.set_default_dtype(torch.float64)
+torch.manual_seed(42)
+np.random.seed(42)
+
+# Band-limit cap omega_max: input-layer frequencies are projected to |omega| <= OMEGA_MAX.
+OMEGA_MAX = 30 * np.pi
+def clamp_frequencies(linear, w_max=OMEGA_MAX):
+    with torch.no_grad():
+        W = linear.weight.data
+        nrm = W.norm(dim=1, keepdim=True)
+        W.mul_((w_max / nrm.clamp_min(1e-12)).clamp(max=1.0))
+
+def to_tensor(x, requires_grad=False):
+    t = torch.tensor(x, dtype=torch.float64, device=device)
+    if requires_grad: t.requires_grad_(True)
+    return t
+
+# --- [工具] 稳健的最小二乘求解器 (投影矩阵优化) ---
+def Robust_Least_Squares(A_list, b_list, weights=None, lambda_reg=1e-6):
+    if weights is None: weights = [1.0] * len(A_list)
+    
+    A_scaled_list = []
+    b_scaled_list = []
+    
+    for i, (A, b, w) in enumerate(zip(A_list, b_list, weights)):
+        A_scaled_list.append(A * w)
+        b_scaled_list.append(b * w)
+        
+    A_final = torch.cat(A_scaled_list, dim=0)
+    b_final = torch.cat(b_scaled_list, dim=0)
+    
+    # 求解 (A^T A + lambda I) x = A^T b
+    ATA = A_final.T @ A_final
+    ATb = A_final.T @ b_final
+    reg = lambda_reg * torch.eye(ATA.shape[0], device=device)
+    
+    try:
+        sol = torch.linalg.solve(ATA + reg, ATb)
+    except:
+        sol = torch.linalg.lstsq(A_final, b_final, driver='gels').solution
+        
+    return sol
+
+# ============================
+# 1. Physics Environment 
+# ============================
+class GroundTruthExample5_2:
+    def __init__(self, N=200): 
+        self.N = N
+        self.x = np.linspace(0, 1, N)
+        self.y = np.linspace(0, 1, N)
+        self.X, self.Y = np.meshgrid(self.x, self.y)
+        self.dx = 1.0 / (N - 1)
+        self.xy_dense = np.stack([self.X.flatten(), self.Y.flatten()], axis=1)
+        
+        # --- 1. 修改 u_true ---
+        self.u_true = 1.0 + np.sin(self.X) * np.sin(self.Y)
+        
+        # --- 2. 保持 q_true 不变 ---
+        self.q_true = 1.0 + 0.5 * np.sin(np.pi * self.X) * np.sin(np.pi * self.Y)
+        
+        # --- 3. 分析计算准确的梯度和 f_true (匹配新的 u) ---
+        self.u_x_true = np.cos(self.X) * np.sin(self.Y)
+        self.u_y_true = np.sin(self.X) * np.cos(self.Y)
+        self.lap_u_true = -2.0 * np.sin(self.X) * np.sin(self.Y)
+        
+        # 方程: -\Delta u + q u = f
+        self.f_true = -self.lap_u_true + self.q_true * self.u_true
+        
+        # 插值器
+        self.u_interp = RegularGridInterpolator((self.y, self.x), self.u_true, method='cubic')
+        self.ux_interp = RegularGridInterpolator((self.y, self.x), self.u_x_true, method='cubic')
+        self.uy_interp = RegularGridInterpolator((self.y, self.x), self.u_y_true, method='cubic')
+        self.f_interp = RegularGridInterpolator((self.y, self.x), self.f_true, method='cubic')
+        self.q_interp = RegularGridInterpolator((self.y, self.x), self.q_true, method='cubic')
+
+    def generate_observation_data(self, n_samples, noise_level=0.01):
+        x_samples = np.random.rand(n_samples, 2)
+        yx_samples = np.stack([x_samples[:, 1], x_samples[:, 0]], axis=1)
+        
+        u_clean = self.u_interp(yx_samples).reshape(-1, 1)
+        ux_clean = self.ux_interp(yx_samples).reshape(-1, 1)
+        uy_clean = self.uy_interp(yx_samples).reshape(-1, 1)
+        f_clean = self.f_interp(yx_samples).reshape(-1, 1)
+        
+        def add_noise(signal, level):
+            std = np.std(signal) + 1e-8
+            return signal + np.random.randn(*signal.shape) * level * std 
+            
+        u_obs = add_noise(u_clean, noise_level)
+        ux_obs = add_noise(ux_clean, noise_level) 
+        uy_obs = add_noise(uy_clean, noise_level)
+        f_known = add_noise(f_clean, noise_level * 0)  # f 无噪声
+        
+        return (self.xy_dense, 
+                to_tensor(x_samples), 
+                to_tensor(u_obs), 
+                to_tensor(np.hstack([ux_obs, uy_obs])),
+                to_tensor(f_known))
+
+# --- 提取统一的边界数据生成函数 ---
+def get_boundary_data(full_xy_dense):
+    mask_left = (full_xy_dense[:,0] == 0)
+    mask_right = (full_xy_dense[:,0] == 1)
+    mask_bottom = (full_xy_dense[:,1] == 0)
+    mask_top = (full_xy_dense[:,1] == 1)
+
+    xy_left = full_xy_dense[mask_left]
+    n_left = np.zeros_like(xy_left); n_left[:, 0] = -1
+    
+    xy_right = full_xy_dense[mask_right]
+    n_right = np.zeros_like(xy_right); n_right[:, 0] = 1
+    
+    xy_bottom = full_xy_dense[mask_bottom]
+    n_bottom = np.zeros_like(xy_bottom); n_bottom[:, 1] = -1
+    
+    xy_top = full_xy_dense[mask_top]
+    n_top = np.zeros_like(xy_top); n_top[:, 1] = 1
+
+    xy_b_np = np.vstack([xy_left, xy_right, xy_bottom, xy_top])
+    n_b_np = np.vstack([n_left, n_right, n_bottom, n_top])
+    
+    # 真实 Neumann 边界解析解: u_x = cos(x)sin(y), u_y = sin(x)cos(y)
+    grad_b_np = np.zeros_like(xy_b_np)
+    grad_b_np[:, 0] = np.cos(xy_b_np[:, 0]) * np.sin(xy_b_np[:, 1])
+    grad_b_np[:, 1] = np.sin(xy_b_np[:, 0]) * np.cos(xy_b_np[:, 1])
+    
+    # 内积得到法向导数 du/dn
+    neumann_b_np = np.sum(grad_b_np * n_b_np, axis=1, keepdims=True)
+
+    return to_tensor(xy_b_np), to_tensor(n_b_np), to_tensor(neumann_b_np)
+
+
+# ============================
+# 1.5. Sobolev Denoising (已升级：加入边界约束)
+# ============================
+class DenoisingNet(nn.Module):
+    def __init__(self, n_hidden=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(2, n_hidden),
+            nn.Tanh(),
+            nn.Linear(n_hidden, n_hidden),
+            nn.Tanh(),
+            nn.Linear(n_hidden, n_hidden),
+            nn.Tanh(),
+            nn.Linear(n_hidden, 1)
+        )
+        
+    def forward(self, x):
+        return self.net(x)
+
+def train_denoiser(x_train, u_train, grad_train, xy_b, n_b, neumann_b_true, epochs=2500, lr=0.001):
+    print(f"\n=== Step 0: Pre-processing (Sobolev Denoising + Neumann BC) ===")
+    
+    x_in = x_train.clone().detach().requires_grad_(True)
+    xy_b_in = xy_b.clone().detach().requires_grad_(True) # 边界点也需要求导
+    
+    model = DenoisingNet(n_hidden=128).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=500, gamma=0.95)
+    
+    for i in range(epochs):
+        optimizer.zero_grad()
+        
+        # 1. 内部观测点 Loss
+        u_pred = model(x_in)
+        grads = torch.autograd.grad(u_pred, x_in, 
+                                    grad_outputs=torch.ones_like(u_pred), 
+                                    create_graph=True)[0]
+        
+        loss_u = torch.mean((u_pred - u_train)**2)
+        loss_g = torch.mean((grads - grad_train)**2)
+        
+        # 2. 边界约束 Loss
+        u_b_pred = model(xy_b_in)
+        grads_b = torch.autograd.grad(u_b_pred, xy_b_in, 
+                                      grad_outputs=torch.ones_like(u_b_pred), 
+                                      create_graph=True)[0]
+        pred_neumann = torch.sum(grads_b * n_b, dim=1, keepdim=True)
+        loss_bc = torch.mean((pred_neumann - neumann_b_true)**2)
+        
+        # 边界约束权重给得高一些 (10.0)，确保边界不崩溃
+        loss = loss_u + 0 * loss_g + 10.0 * loss_bc 
+        
+        loss.backward()
+        optimizer.step()
+        scheduler.step()
+            
+    print(f"  [Denoiser] Final Loss: {loss.item():.6f}")
+    
+    def get_denoised_data(x_input):
+        with torch.enable_grad(): 
+            x_temp = x_input.clone().detach().requires_grad_(True)
+            u_p = model(x_temp)
+            g_p = torch.autograd.grad(u_p, x_temp, grad_outputs=torch.ones_like(u_p), create_graph=False)[0]
+        return u_p.detach(), g_p.detach()
+        
+    return get_denoised_data
+
+# ============================
+# 2. 神经网络基底 (包含频谱分析)
+# ============================
+class SLFNBasis2D(nn.Module):
+    def __init__(self, n_hidden):
+        super().__init__()
+        self.n_hidden = n_hidden
+        self.linear = nn.Linear(2, n_hidden)
+        self.output_weight = nn.Parameter(torch.zeros(n_hidden, 1, dtype=torch.float64), requires_grad=False)
+        
+    def get_features(self, x):
+        return torch.sin(self.linear(x))
+
+    def init_hybrid(self, residual_grid, ratio=0.7, freq_scale=4.0):
+        if residual_grid is None or np.all(residual_grid == 0):
+            nn.init.xavier_uniform_(self.linear.weight)
+            nn.init.uniform_(self.linear.bias, -np.pi, np.pi)
+            clamp_frequencies(self.linear)
+            return
+        
+        F = np.fft.fft2(residual_grid)
+        F_mag = np.abs(np.fft.fftshift(F))
+        N_grid = residual_grid.shape[0]
+        n_fft = int(self.n_hidden * ratio)
+        n_rand = self.n_hidden - n_fft
+        
+        indices = np.argsort(F_mag.flatten())[-n_fft:]
+        freqs_fft = []
+        for idx in indices:
+            iy, ix = np.unravel_index(idx, (N_grid, N_grid))
+            fx = (ix - N_grid//2) * 2 * np.pi 
+            fy = (iy - N_grid//2) * 2 * np.pi 
+            freqs_fft.append([fx, fy])
+            
+        freqs_rand = (torch.rand(n_rand, 2, dtype=torch.float64, device=device) * 2 - 1) * freq_scale * np.pi
+        W_final = torch.cat([torch.tensor(freqs_fft, device=device), freqs_rand], dim=0) if n_fft > 0 else freqs_rand
+            
+        with torch.no_grad():
+            self.linear.weight.data = W_final
+            self.linear.bias.data.uniform_(-np.pi, np.pi)
+        clamp_frequencies(self.linear)
+
+    def get_u_features_grads_laplacian(self, x):
+        z = self.linear(x)
+        phi = torch.sin(z)
+        dphi_dz = torch.cos(z)
+        W = self.linear.weight
+        W0 = W[:, 0:1].T; W1 = W[:, 1:2].T
+        dphi_dx = dphi_dz * W0
+        dphi_dy = dphi_dz * W1
+        d2phi_dz2 = -torch.sin(z)
+        lap_phi = d2phi_dz2 * (W0**2 + W1**2)
+        return phi, dphi_dx, dphi_dy, lap_phi
+
+    def forward(self, x):
+        return self.get_features(x) @ self.output_weight
+    
+    def forward_full(self, x):
+        phi, dx, dy, lap = self.get_u_features_grads_laplacian(x)
+        w = self.output_weight
+        return phi @ w, torch.cat([dx@w, dy@w], dim=1), lap @ w
+
+# ============================
+# 3. 交替求解器 (融入 Tikhonov H2 正则化)
+# ============================
+class AlternatingSolver:
+    def __init__(self, full_xy_dense, x_obs, u_obs, grad_obs, f_known, u_true_grid, xy_b, n_b, neumann_b_true):
+        self.full_xy_dense = full_xy_dense
+        self.x_obs = x_obs
+        self.u_obs = u_obs
+        self.grad_obs = grad_obs
+        self.f_known = f_known
+        
+        self.u_bases = nn.ModuleList()
+        self.q_bases = nn.ModuleList()
+        self.grid_N = 80 
+        
+        # 接收主程序传来的统一边界数据
+        self.xy_b = xy_b
+        self.n_b = n_b
+        self.neumann_b_true = neumann_b_true
+
+    def get_u(self, x):
+        if not self.u_bases: return torch.zeros((x.shape[0], 1), device=device)
+        res = torch.zeros((x.shape[0], 1), device=device)
+        for b in self.u_bases: res = res + b(x)
+        return res
+
+    def get_q(self, x):
+        if not self.q_bases: return torch.zeros((x.shape[0], 1), device=device)
+        res = torch.zeros((x.shape[0], 1), device=device)
+        for b in self.q_bases: res = res + b(x)
+        return res
+    
+    def predict_lap_u(self, x):
+        res = torch.zeros((x.shape[0], 1), device=device)
+        for b in self.u_bases:
+            _, _, lap_b = b.forward_full(x)
+            res = res + lap_b
+        return res
+
+    def sample_batch(self, batch_size=4500):
+        n_uniform = int(batch_size * (3000.0 / 4500.0)) 
+        n_adaptive = batch_size - n_uniform
+        
+        if len(self.u_bases) == 0:
+            idx = torch.randperm(len(self.u_obs), device=device)[:batch_size]
+        else:
+            with torch.no_grad():
+                idx_uniform = torch.randperm(len(self.u_obs), device=device)[:n_uniform]
+                
+                u_curr = self.get_u(self.x_obs)
+                q_curr = self.get_q(self.x_obs)
+                lap_curr = self.predict_lap_u(self.x_obs)
+                
+                pde_res = torch.abs(-lap_curr + q_curr * u_curr - self.f_known).squeeze()
+                weights = pde_res + pde_res.mean() * 0.5 
+                
+                idx_adaptive = torch.multinomial(weights, n_adaptive, replacement=False)
+                idx = torch.cat([idx_uniform, idx_adaptive])
+                
+        return self.x_obs[idx], self.u_obs[idx], self.grad_obs[idx], self.f_known[idx]
+
+    # --- Step U ---
+    def step_add_u(self, n_neurons):
+        x_train, u_train, g_train, f_train = self.sample_batch(4500)
+        
+        with torch.no_grad():
+            u_curr = self.get_u(x_train)
+            u_res = u_train - u_curr
+            scale_norm = torch.linalg.norm(u_res) + 1e-8
+            scale = scale_norm.item() if scale_norm < 1.0 else 1.0
+            
+            xg = np.linspace(0, 1, self.grid_N); Xg, Yg = np.meshgrid(xg, xg)
+            resid_grid = griddata(x_train.cpu().numpy(), (u_res/scale).cpu().numpy().flatten(), (Xg, Yg), fill_value=0)
+            q_curr = self.get_q(x_train).detach()
+            
+        new_basis = SLFNBasis2D(n_neurons).to(device)
+        new_basis.init_hybrid(resid_grid, ratio=0.8, freq_scale=4.0)
+        
+        self.u_bases.append(new_basis)
+        new_basis.requires_grad_(True); new_basis.output_weight.requires_grad_(True)
+        
+        u_old = torch.zeros_like(u_train)
+        g_old = torch.zeros_like(g_train)
+        lap_u_old = torch.zeros_like(u_train)
+        pred_neumann_old = torch.zeros_like(self.neumann_b_true)
+        
+        with torch.no_grad():
+            for b in self.u_bases[:-1]:
+                ub, gb, lb = b.forward_full(x_train)
+                u_old += ub; g_old += gb; lap_u_old += lb
+                
+                _, gb_b, _ = b.forward_full(self.xy_b)
+                pred_neumann_old += torch.sum(gb_b * self.n_b, dim=1, keepdim=True)
+        
+        optimizer = torch.optim.Adam(new_basis.parameters(), lr=0.005)
+        
+        for i in range(500):
+            optimizer.zero_grad()
+            ub, gb, lb = new_basis.forward_full(x_train)
+            
+            u_total = u_old + ub
+            g_total = g_old + gb
+            lap_total = lap_u_old + lb
+            
+            _, gb_b_new, _ = new_basis.forward_full(self.xy_b)
+            pred_neumann_new = torch.sum(gb_b_new * self.n_b, dim=1, keepdim=True)
+            
+            loss_u = torch.mean(((u_total - u_train) / scale)**2)
+            loss_g = torch.mean(((g_total - g_train) / scale)**2)
+            
+            loss_bc = torch.mean(((pred_neumann_old + pred_neumann_new - self.neumann_b_true) / scale)**2)
+            loss_pde = torch.mean(((-lap_total + q_curr * u_total - f_train) / scale)**2)
+            
+            loss = 1.0*loss_u + 1.0*loss_g + 0.005*loss_pde + 10.0*loss_bc
+            loss.backward()
+            optimizer.step()
+            
+        clamp_frequencies(new_basis.linear)
+        for p in new_basis.parameters(): p.requires_grad = False
+        self.update_coeffs_u(x_train, u_train, g_train, f_train)
+
+    def update_coeffs_u(self, x, u_obs, g_obs, f_obs):
+        Phi, Gx, Gy, Lap = [], [], [], []
+        with torch.no_grad():
+            for b in self.u_bases:
+                p, dx, dy, lap = b.get_u_features_grads_laplacian(x)
+                Phi.append(p); Gx.append(dx); Gy.append(dy); Lap.append(lap)
+            q_curr = self.get_q(x).detach()
+                
+        Gx_b, Gy_b = [], []
+        with torch.no_grad():
+            for b in self.u_bases:
+                _, dx, dy, _ = b.get_u_features_grads_laplacian(self.xy_b)
+                Gx_b.append(dx); Gy_b.append(dy)
+        
+        Neumann_A = torch.cat(Gx_b, 1) * self.n_b[:, 0:1] + torch.cat(Gy_b, 1) * self.n_b[:, 1:2]
+        # Physics residual block (eq. joint_opt_cd), parameter d fixed:  (-Delta phi_j + b phi_j) c_j = f
+        Phi_cat = torch.cat(Phi, 1)
+        PDE_A = -torch.cat(Lap, 1) + q_curr * Phi_cat
+        w_pde = 0.005
+
+        A = torch.cat([10*Phi_cat, torch.cat(Gx,1), torch.cat(Gy,1), 10*Neumann_A, w_pde*PDE_A], dim=0)
+        b_vec = torch.cat([10*u_obs, g_obs[:,0:1], g_obs[:,1:2], 10*self.neumann_b_true, w_pde*f_obs], dim=0)
+        
+        coeffs = Robust_Least_Squares([A], [b_vec], lambda_reg=1e-5)
+        curr = 0
+        for b in self.u_bases:
+            b.output_weight.data = coeffs[curr:curr+b.n_hidden]
+            curr += b.n_hidden
+
+    # --- Step Q ---
+    def step_add_q(self, n_neurons):
+        x_train, _, _, f_train = self.sample_batch(4500)
+        
+        with torch.no_grad():
+            u_curr = self.get_u(x_train).detach()
+            lap_u_curr = self.predict_lap_u(x_train).detach()
+            q_old = self.get_q(x_train).detach()
+            rhs_residual = (f_train + lap_u_curr) - q_old * u_curr
+            resid_grid = np.zeros((self.grid_N, self.grid_N))
+
+        new_basis = SLFNBasis2D(n_neurons).to(device)
+        new_basis.init_hybrid(resid_grid, ratio=0.0, freq_scale=1.5)
+        
+        self.q_bases.append(new_basis)
+        new_basis.requires_grad_(True); new_basis.output_weight.requires_grad_(True)
+        
+        scale_q_norm = torch.linalg.norm(rhs_residual) + 1e-8
+        scale_q = scale_q_norm.item() if scale_q_norm < 1.0 else 1.0
+        
+        optimizer = torch.optim.Adam(new_basis.parameters(), lr=0.02)
+        
+        for i in range(800):
+            optimizer.zero_grad()
+            q_sub = new_basis(x_train)
+            loss_fit = torch.mean(((q_sub * u_curr - rhs_residual) / scale_q)**2)
+            
+            w_mag = torch.mean(new_basis.linear.weight**2)
+            loss_freq = 5e-3 * w_mag 
+            
+            loss = loss_fit + loss_freq
+            loss.backward()
+            optimizer.step()
+
+        clamp_frequencies(new_basis.linear)
+        for p in new_basis.parameters(): p.requires_grad = False
+
+        with torch.no_grad():
+            rhs_target = f_train + lap_u_curr
+            Phi_u_list = []
+            for b in self.q_bases:
+                phi = b.get_features(x_train)
+                Phi_u_list.append(phi * u_curr)
+            
+            A = torch.cat(Phi_u_list, dim=1)
+            coeffs = Robust_Least_Squares([A], [rhs_target], lambda_reg=1e-4)
+            curr = 0
+            for b in self.q_bases:
+                b.output_weight.data = coeffs[curr:curr+b.n_hidden].reshape(-1, 1)
+                curr += b.n_hidden
+
+    # --- [灵魂核心：Joint Polishing] ---
+    def joint_polishing(self, lambda_reg=1e-4):
+        if not self.q_bases: return
+        print(f"    >>> Joint Polishing (with Tikhonov H2 Regularization: lambda={lambda_reg})...")
+        
+        params = [p for b in self.u_bases for p in b.parameters()] + \
+                 [p for b in self.q_bases for p in b.parameters()]
+        for p in params: p.requires_grad_(True)
+        
+        optimizer = torch.optim.LBFGS(params, lr=0.1, max_iter=50, line_search_fn="strong_wolfe")
+        x_bat, u_bat, _, f_bat = self.sample_batch(4000)
+        
+        def closure():
+            optimizer.zero_grad()
+            
+            u = torch.zeros((x_bat.shape[0], 1), device=device)
+            lap_u = torch.zeros((x_bat.shape[0], 1), device=device)
+            for b in self.u_bases:
+                ub, _, lap_b = b.forward_full(x_bat) 
+                u = u + ub
+                lap_u = lap_u + lap_b
+                
+            q = torch.zeros((x_bat.shape[0], 1), device=device)
+            dq_dx = torch.zeros((x_bat.shape[0], 1), device=device)
+            dq_dy = torch.zeros((x_bat.shape[0], 1), device=device)
+            d2q_dx2 = torch.zeros((x_bat.shape[0], 1), device=device)
+            d2q_dy2 = torch.zeros((x_bat.shape[0], 1), device=device)
+            d2q_dxdy = torch.zeros((x_bat.shape[0], 1), device=device)
+            
+            for b in self.q_bases:
+                z = b.linear(x_bat)
+                phi = torch.sin(z)
+                dphi_dz = torch.cos(z)
+                d2phi_dz2 = -torch.sin(z)
+                
+                W = b.linear.weight
+                W0 = W[:, 0:1].T  
+                W1 = W[:, 1:2].T  
+                w_out = b.output_weight
+                
+                q = q + (phi @ w_out)
+                dq_dx = dq_dx + ((dphi_dz * W0) @ w_out)
+                dq_dy = dq_dy + ((dphi_dz * W1) @ w_out)
+                d2q_dx2 = d2q_dx2 + ((d2phi_dz2 * (W0**2)) @ w_out)
+                d2q_dy2 = d2q_dy2 + ((d2phi_dz2 * (W1**2)) @ w_out)
+                d2q_dxdy = d2q_dxdy + ((d2phi_dz2 * (W0 * W1)) @ w_out)
+            
+            loss_data = torch.mean((u - u_bat)**2)
+            loss_pde = torch.mean((-lap_u + q * u - f_bat)**2)
+            
+            grad_u_b = torch.zeros((self.xy_b.shape[0], 2), device=device)
+            for b in self.u_bases:
+                _, gb_b, _ = b.forward_full(self.xy_b)
+                grad_u_b = grad_u_b + gb_b
+            pred_neumann = torch.sum(grad_u_b * self.n_b, dim=1, keepdim=True)
+            loss_bc = torch.mean((pred_neumann - self.neumann_b_true)**2)
+            
+            loss_H2_q = torch.mean(q**2 + dq_dx**2 + dq_dy**2 + d2q_dx2**2 + d2q_dy2**2 + 2*(d2q_dxdy**2))
+            
+            loss = loss_data + loss_pde + 10.0 * loss_bc + lambda_reg * loss_H2_q
+            loss.backward()
+            return loss
+            
+        optimizer.step(closure)
+        for b in self.u_bases: clamp_frequencies(b.linear)
+        for b in self.q_bases: clamp_frequencies(b.linear)
+        for p in params: p.requires_grad_(False)
+
+    def solve(self, stages=5):
+        print("=== Solver Start ===")
+        for s in range(stages):
+            print(f"\n--- Stage {s+1} ---")
+            self.step_add_u(30 + s*5)
+            self.step_add_q(30 + s*5)
+            
+            if (s+1)%2 == 0:
+                self.joint_polishing(lambda_reg=1e-6)
+
+# ============================
+# 4. Main
+# ============================
+if __name__ == "__main__":
+    gt = GroundTruthExample5_2(N=200)
+    
+    N_SAMPLES = 4500 
+    import sys
+    NOISE = float(sys.argv[1]) if len(sys.argv) > 1 else 0.5
+    print(f"Generating data with {NOISE*100}% noise and {N_SAMPLES} samples...")
+    
+    # 1. 生成内部含噪数据
+    full_xy, x_train, u_train, grad_train, f_known = gt.generate_observation_data(10000, NOISE)
+    
+    # 2. 统一生成无噪的边界条件数据
+    xy_b, n_b, neumann_b_true = get_boundary_data(full_xy)
+    
+    # 3. 将边界条件数据传入去噪网络，增强平滑效果！
+    if NOISE >= 0.10:
+        get_denoised = train_denoiser(x_train, u_train, grad_train, xy_b, n_b, neumann_b_true, epochs=5000)
+        u_train_denoised, grad_train_denoised = get_denoised(x_train)
+    else:
+        u_train_denoised, grad_train_denoised = u_train, grad_train
+    
+    # 4. 求解器同样使用这份统一的边界数据
+    u_true_grid = gt.u_true
+    solver = AlternatingSolver(full_xy, x_train, u_train_denoised, grad_train_denoised, f_known, u_true_grid, xy_b, n_b, neumann_b_true)
+    solver.solve(stages=4)
+    
+    # ============================
+    # Plotting
+    # ============================
+    print("\nEvaluating and Plotting...")
+    N_plot = 100
+    r_min, r_max = 0, 1
+    extent_range = [r_min, r_max, r_min, r_max]
+
+    x_p = np.linspace(r_min, r_max, N_plot)
+    y_p = np.linspace(r_min, r_max, N_plot)
+    X_p, Y_p = np.meshgrid(x_p, y_p)
+
+    xy_tensor = to_tensor(np.stack([X_p.flatten(), Y_p.flatten()], axis=1))
+    yx_numpy = np.stack([Y_p.flatten(), X_p.flatten()], axis=1)
+
+    u_pred_val = solver.get_u(xy_tensor).detach().cpu().numpy().reshape(N_plot, N_plot)
+    q_pred_val = solver.get_q(xy_tensor).detach().cpu().numpy().reshape(N_plot, N_plot)
+
+    u_true_val = gt.u_interp(yx_numpy).reshape(N_plot, N_plot)
+    q_true_val = gt.q_interp(yx_numpy).reshape(N_plot, N_plot)
+
+    u_abs_err = np.abs(u_pred_val - u_true_val)
+    q_abs_err = np.abs(q_pred_val - q_true_val)
+    
+    err_u = np.linalg.norm(u_abs_err)/np.linalg.norm(u_true_val)
+    err_q = np.linalg.norm(q_abs_err)/np.linalg.norm(q_true_val)
+    print(f"Rel Error u: {err_u:.4e}")
+    print(f"Rel Error q: {err_q:.4e}")
+
+    # --- 图 1: Predicted u ---
+    plt.figure(figsize=(5, 4))
+    plt.title(f"Predicted u (Err: {err_u:.2%})")
+    plt.imshow(u_pred_val, origin='lower', extent=extent_range, cmap='viridis')
+    plt.colorbar()
+    plt.xlabel('x')
+    plt.ylabel('y')
+    plt.tight_layout()
+    plt.savefig("example2_pred_u.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+    # --- 图 2: Absolute Error u ---
+    plt.figure(figsize=(5, 4))
+    plt.title("Absolute Error |u|")
+    plt.imshow(u_abs_err, origin='lower', extent=extent_range, cmap='inferno')
+    plt.colorbar()
+    plt.xlabel('x')
+    plt.ylabel('y')
+    plt.tight_layout()
+    plt.savefig("example2_err_u.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+    # --- 图 3: Predicted q ---
+    plt.figure(figsize=(5, 4))
+    plt.imshow(q_pred_val, origin='lower', extent=extent_range, cmap='jet', vmin=1.0, vmax=1.5)
+    plt.colorbar()
+    plt.xlabel('x')
+    plt.ylabel('y')
+    plt.tight_layout()
+    plt.savefig("example2_pred_q.png", dpi=150, bbox_inches="tight")
+    plt.close()
+
+    # --- 图 4: Absolute Error q ---
+    plt.figure(figsize=(5, 4))
+    plt.title("Absolute Error |q|")
+    plt.imshow(q_abs_err, origin='lower', extent=extent_range, cmap='inferno')
+    plt.colorbar()
+    plt.xlabel('x')
+    plt.ylabel('y')
+    plt.tight_layout()
+    plt.savefig("example2_err_q.png", dpi=150, bbox_inches="tight")
+    plt.close()
