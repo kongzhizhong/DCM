@@ -18,8 +18,6 @@ if torch.cuda.is_available():
     torch.cuda.init()
 
 torch.set_default_dtype(torch.float64)
-torch.manual_seed(42)
-np.random.seed(42)
 
 # Band-limit cap omega_max: input-layer frequencies are projected to |omega| <= OMEGA_MAX.
 OMEGA_MAX = 30 * np.pi
